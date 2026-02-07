@@ -14,16 +14,10 @@ Multi-sensor fusion pipeline combining **LiDAR point clouds** with **camera imag
 ### Fusion Visualization
 
 <p align="center">
-  <img src="assets/fusion_result.png" alt="Fusion Result" width="900"/>
+  <img src="assets/fusion_results.png" alt="Fusion Result" width="900"/>
 </p>
 
-*Top: Camera view with 2D detections and LiDAR overlay. Bottom: Bird's eye view with 3D bounding boxes.*
-
-### Pipeline Overview
-
-<p align="center">
-  <img src="assets/pipeline.png" alt="Pipeline" width="800"/>
-</p>
+*Top: Camera view with LiDAR point cloud overlay (depth-colored). Bottom left: Bird's eye view showing point distribution. Bottom right: Detection statistics.*
 
 ---
 
