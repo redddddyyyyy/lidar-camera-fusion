@@ -294,117 +294,244 @@ class SensorFusion:
         return fused_objects
 
 
-class TemporalFusion:
+class KalmanTrack:
     """
-    Temporal fusion for tracking objects across frames.
+    Single-object Kalman filter track.
 
-    Uses simple IoU-based tracking.
+    State vector:  x = [px, py, pz, vx, vy, vz]   (position + velocity)
+    Observation:   z = [px, py, pz]                 (3-D centre from fusion)
+
+    Constant-velocity model with dt=1 (one frame).  All units in metres.
     """
 
-    def __init__(self, max_age: int = 5, min_hits: int = 3, iou_threshold: float = 0.3):
-        """
-        Initialize temporal fusion.
+    # State-transition matrix F  (constant-velocity)
+    _F = np.array([
+        [1, 0, 0, 1, 0, 0],
+        [0, 1, 0, 0, 1, 0],
+        [0, 0, 1, 0, 0, 1],
+        [0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 1],
+    ], dtype=np.float64)
 
-        Args:
-            max_age: Maximum frames to keep track without detection
-            min_hits: Minimum detections before track is confirmed
-            iou_threshold: IoU threshold for matching
-        """
+    # Observation matrix H  (we only observe position)
+    _H = np.array([
+        [1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0],
+    ], dtype=np.float64)
+
+    # Process noise Q  (tuned: position noise 0.1 m, velocity noise 1 m/s²)
+    _Q = np.diag([0.01, 0.01, 0.01, 1.0, 1.0, 1.0]).astype(np.float64)
+
+    # Measurement noise R  (LiDAR centroid uncertainty ~0.1 m per axis)
+    _R = np.diag([0.1, 0.1, 0.1]).astype(np.float64)
+
+    def __init__(self, fused_obj: FusedObject, track_id: int):
+        self.track_id = track_id
+        self.label = fused_obj.label
+        self.hits = 1
+        self.age = 0               # frames since last matched detection
+
+        # Initial state from first 3-D centre; velocity = 0
+        if fused_obj.has_3d:
+            pos = fused_obj.bbox_3d.center.copy()
+        else:
+            pos = np.zeros(3)
+
+        self.x = np.array([pos[0], pos[1], pos[2], 0.0, 0.0, 0.0], dtype=np.float64)
+        self.P = np.eye(6, dtype=np.float64) * 10.0   # initial uncertainty
+
+        # Keep the most recent FusedObject for downstream use
+        self.last_fused: FusedObject = fused_obj
+
+    # ------------------------------------------------------------------ #
+    # Kalman predict / update
+    # ------------------------------------------------------------------ #
+
+    def predict(self) -> np.ndarray:
+        """Predict next state (call once per frame before update)."""
+        self.x = self._F @ self.x
+        self.P = self._F @ self.P @ self._F.T + self._Q
+        self.age += 1
+        return self.x[:3]          # predicted position
+
+    def update(self, fused_obj: FusedObject) -> None:
+        """Correct state with a new matched detection."""
+        if not fused_obj.has_3d:
+            # No 3-D info — skip Kalman update but keep the track alive
+            self.hits += 1
+            self.age = 0
+            self.last_fused = fused_obj
+            return
+
+        z = fused_obj.bbox_3d.center.astype(np.float64)   # (3,)
+
+        # Innovation
+        y = z - self._H @ self.x
+        S = self._H @ self.P @ self._H.T + self._R
+        K = self.P @ self._H.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ y
+        self.P = (np.eye(6) - K @ self._H) @ self.P
+
+        self.hits += 1
+        self.age = 0
+        self.last_fused = fused_obj
+
+    @property
+    def position(self) -> np.ndarray:
+        """Current (filtered) 3-D position estimate."""
+        return self.x[:3].copy()
+
+    @property
+    def velocity(self) -> np.ndarray:
+        """Current velocity estimate (m/frame)."""
+        return self.x[3:].copy()
+
+
+class KalmanTracker:
+    """
+    Multi-object Kalman filter tracker.
+
+    Replaces the original IoU-only TemporalFusion with:
+    - Per-object Kalman filters for position + velocity estimation
+    - Hungarian (optimal) assignment via scipy.optimize.linear_sum_assignment
+    - 3-D distance gating on matched pairs (ignores clearly wrong matches)
+    - Graceful fallback to 2-D IoU when a detection has no 3-D box
+
+    Public API mirrors the old TemporalFusion.update() signature.
+    """
+
+    def __init__(
+        self,
+        max_age: int = 5,
+        min_hits: int = 3,
+        dist_threshold: float = 5.0,   # max 3-D distance (m) for a valid match
+        iou_threshold: float = 0.3,    # 2-D IoU fallback threshold
+    ):
         self.max_age = max_age
         self.min_hits = min_hits
+        self.dist_threshold = dist_threshold
         self.iou_threshold = iou_threshold
 
-        self.tracks: List[Dict] = []
+        self.tracks: List[KalmanTrack] = []
         self.next_id = 0
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
 
     def update(self, fused_objects: List[FusedObject]) -> List[FusedObject]:
         """
-        Update tracks with new fused objects.
+        Update all tracks with new detections for this frame.
 
-        Returns fused objects with track IDs assigned.
+        Returns the list of confirmed FusedObjects (hits >= min_hits),
+        with their Kalman-filtered 3-D centres written back in.
         """
-        # Match new detections to existing tracks
+        # 1. Predict step for every existing track
+        for track in self.tracks:
+            track.predict()
+
+        # 2. Match detections → tracks
         matched, unmatched_dets, unmatched_tracks = self._match(fused_objects)
 
-        # Update matched tracks
-        for track_idx, det_idx in matched:
-            self.tracks[track_idx]['object'] = fused_objects[det_idx]
-            self.tracks[track_idx]['hits'] += 1
-            self.tracks[track_idx]['age'] = 0
+        # 3. Update matched tracks
+        for t_idx, d_idx in matched:
+            self.tracks[t_idx].update(fused_objects[d_idx])
 
-        # Create new tracks for unmatched detections
-        for det_idx in unmatched_dets:
-            self.tracks.append({
-                'id': self.next_id,
-                'object': fused_objects[det_idx],
-                'hits': 1,
-                'age': 0
-            })
+        # 4. Spawn new tracks for unmatched detections
+        for d_idx in unmatched_dets:
+            self.tracks.append(KalmanTrack(fused_objects[d_idx], self.next_id))
             self.next_id += 1
 
-        # Age unmatched tracks
-        for track_idx in unmatched_tracks:
-            self.tracks[track_idx]['age'] += 1
+        # 5. Remove stale tracks
+        self.tracks = [t for t in self.tracks if t.age < self.max_age]
 
-        # Remove old tracks
-        self.tracks = [t for t in self.tracks if t['age'] < self.max_age]
-
-        # Return confirmed tracks
-        confirmed = [t['object'] for t in self.tracks if t['hits'] >= self.min_hits]
+        # 6. Return confirmed tracks; patch FusedObject centre with Kalman estimate
+        confirmed: List[FusedObject] = []
+        for track in self.tracks:
+            if track.hits >= self.min_hits:
+                obj = track.last_fused
+                if obj.has_3d:
+                    # Overwrite centre with Kalman-filtered position
+                    obj.bbox_3d.center = track.position
+                    obj.distance = float(np.linalg.norm(track.position))
+                confirmed.append(obj)
 
         return confirmed
 
-    def _match(self, fused_objects: List[FusedObject]):
-        """Match detections to tracks using IoU."""
-        if not self.tracks or not fused_objects:
-            unmatched_dets = list(range(len(fused_objects)))
-            unmatched_tracks = list(range(len(self.tracks)))
-            return [], unmatched_dets, unmatched_tracks
+    # ------------------------------------------------------------------ #
+    # Matching
+    # ------------------------------------------------------------------ #
 
-        # Compute IoU matrix
-        iou_matrix = np.zeros((len(self.tracks), len(fused_objects)))
+    def _match(
+        self,
+        detections: List[FusedObject]
+    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+        """
+        Hungarian matching between current tracks and new detections.
 
-        for t, track in enumerate(self.tracks):
-            for d, det in enumerate(fused_objects):
-                iou_matrix[t, d] = self._iou_2d(
-                    track['object'].detection_2d.bbox,
-                    det.detection_2d.bbox
-                )
+        Cost matrix uses 3-D Euclidean distance when both sides have 3-D boxes,
+        falling back to negative 2-D IoU otherwise.
+        """
+        from scipy.optimize import linear_sum_assignment
 
-        # Greedy matching
-        matched = []
-        unmatched_dets = set(range(len(fused_objects)))
-        unmatched_tracks = set(range(len(self.tracks)))
+        if not self.tracks or not detections:
+            return [], list(range(len(detections))), list(range(len(self.tracks)))
 
-        while True:
-            max_iou = self.iou_threshold
-            best_match = None
+        T, D = len(self.tracks), len(detections)
+        cost = np.full((T, D), fill_value=1e6, dtype=np.float64)
 
-            for t in unmatched_tracks:
-                for d in unmatched_dets:
-                    if iou_matrix[t, d] > max_iou:
-                        max_iou = iou_matrix[t, d]
-                        best_match = (t, d)
+        for t_idx, track in enumerate(self.tracks):
+            for d_idx, det in enumerate(detections):
+                if det.has_3d:
+                    # 3-D distance between Kalman prediction and detection centre
+                    cost[t_idx, d_idx] = float(
+                        np.linalg.norm(track.position - det.bbox_3d.center)
+                    )
+                else:
+                    # Fallback: convert IoU to cost (lower = better)
+                    iou = _iou_2d(track.last_fused.detection_2d.bbox,
+                                  det.detection_2d.bbox)
+                    cost[t_idx, d_idx] = 1.0 - iou
 
-            if best_match is None:
-                break
+        row_ind, col_ind = linear_sum_assignment(cost)
 
-            matched.append(best_match)
-            unmatched_tracks.discard(best_match[0])
-            unmatched_dets.discard(best_match[1])
+        matched, unmatched_dets, unmatched_tracks = [], [], []
+        matched_t, matched_d = set(), set()
 
-        return matched, list(unmatched_dets), list(unmatched_tracks)
+        for t_idx, d_idx in zip(row_ind, col_ind):
+            det = detections[d_idx]
+            if det.has_3d and cost[t_idx, d_idx] > self.dist_threshold:
+                continue   # gate: too far apart
+            if not det.has_3d and cost[t_idx, d_idx] > (1.0 - self.iou_threshold):
+                continue   # gate: IoU too low
+            matched.append((t_idx, d_idx))
+            matched_t.add(t_idx)
+            matched_d.add(d_idx)
 
-    @staticmethod
-    def _iou_2d(box1: Tuple, box2: Tuple) -> float:
-        """Compute 2D IoU."""
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
+        unmatched_tracks = [i for i in range(T) if i not in matched_t]
+        unmatched_dets   = [i for i in range(D) if i not in matched_d]
 
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        return matched, unmatched_dets, unmatched_tracks
 
-        return inter / (area1 + area2 - inter) if (area1 + area2 - inter) > 0 else 0
+
+# ------------------------------------------------------------------ #
+# Shared helper (used by KalmanTracker and SensorFusion)
+# ------------------------------------------------------------------ #
+
+def _iou_2d(box1: Tuple, box2: Tuple) -> float:
+    """Compute 2D IoU between two (x1,y1,x2,y2) boxes."""
+    x1 = max(box1[0], box2[0]);  y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2]);  y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    a1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    a2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    denom = a1 + a2 - inter
+    return inter / denom if denom > 0 else 0.0
+
+
+# Keep the old name as an alias so existing code that imports TemporalFusion
+# continues to work during the transition.
+TemporalFusion = KalmanTracker
