@@ -1,0 +1,585 @@
+================================================================================
+  LiDAR-CAMERA FUSION PROJECT — INTERVIEW REFERENCE GUIDE
+  Full story: what we built, how we built it, what broke, and how we fixed it
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. WHAT IS THIS PROJECT — THE 30-SECOND PITCH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+We built a real-time frustum-based LiDAR-camera sensor fusion pipeline for 3D
+object detection and tracking. The system takes in a camera image and a LiDAR
+point cloud simultaneously, uses YOLOv8 to detect objects in the camera image,
+projects those 2D detections into 3D frustums using camera-LiDAR calibration,
+extracts LiDAR points within each frustum, clusters them, fits a PCA-oriented
+3D bounding box, and tracks objects across frames using a Kalman filter with
+Hungarian matching. Everything runs live inside ROS2 and visualizes in RViz2.
+
+Why frustum-based? Because camera gives you semantics — what something is —
+and LiDAR gives you metric depth — exactly where it is in 3D space. Neither
+sensor alone is sufficient. Camera has no depth. LiDAR has no class labels.
+Fusion gives you both.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. FULL PIPELINE — STEP BY STEP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1 — 2D Detection (src/detector.py)
+  YOLOv8n runs on each camera frame and outputs 2D bounding boxes with class
+  labels (car, truck, bus, person, etc.) and confidence scores. We filter to
+  driving-relevant COCO classes only. Confidence threshold is 0.2 (lowered from
+  the default 0.5 because our data is synthetic and YOLO scores lower on sim).
+
+Step 2 — Frustum Extraction (src/calibration.py)
+  For each 2D bounding box, we back-project it into a 3D frustum using the
+  camera intrinsic matrix K (3x3) and the LiDAR-to-camera extrinsic transform T
+  (4x4). The frustum is a truncated pyramid extending from the camera origin out
+  through the 2D box. Any LiDAR point that projects into that image-space box is
+  considered "inside" the frustum.
+
+  Projection formula:
+    p_cam = T @ p_lidar          (LiDAR frame → camera frame, homogeneous)
+    p_img = cv2.projectPoints()  (camera frame → image plane, with distortion)
+
+  We use cv2.projectPoints() rather than a manual K @ x division so that full
+  radial (k1, k2, k3) and tangential (p1, p2) distortion is applied. For zero-
+  distortion data like KITTI this is a no-op. For real cameras it matters a lot.
+
+Step 3 — Ground Removal (src/lidar_processor.py)
+  Before clustering we strip the ground plane using RANSAC. We randomly sample
+  3 points, fit a plane, count inliers within a height threshold, and keep the
+  best plane found over N iterations. Critical fix: we added a horizontality
+  guard — we only accept planes whose normal vector is within a tolerance of
+  straight up (|dot(normal, Z)| >= threshold). Without this guard, RANSAC would
+  sometimes pick a building wall or parked car roof as the "ground" and strip it.
+
+Step 4 — Voxel Clustering (src/lidar_processor.py)
+  Non-ground points are voxelized and connected components are found via BFS.
+  Each connected voxel cluster maps to one object candidate. The original code
+  had a critical O(N²) bug here — see Section 4 for the full story.
+
+Step 5 — 3D Bounding Box + PCA Yaw (src/lidar_processor.py)
+  For each cluster we fit a 3D oriented bounding box. Instead of axis-aligned
+  (which always had yaw=0.0), we run PCA on the XY plane of the cluster points.
+  The dominant eigenvector gives the heading angle (yaw). We rotate the cluster
+  into the PCA frame, compute AABB there, then rotate the box back. The result
+  is a tight oriented box that matches the object's actual heading.
+
+Step 6 — Kalman Filter Tracking (src/fusion.py)
+  FusedObjects from each frame are handed to a KalmanTracker. Each track keeps:
+    State vector:   [x, y, z, vx, vy, vz]
+    Observation:    [x, y, z]  (3D centroid from fusion)
+    Motion model:   constant velocity
+    Process noise Q and measurement noise R tuned empirically
+  Track-detection assignment uses scipy.optimize.linear_sum_assignment (the
+  Hungarian algorithm) on a 3D Euclidean distance cost matrix. Matches beyond
+  dist_threshold metres are rejected. Tracks survive up to max_age=8 missed
+  frames before deletion. min_hits=2 means a track must be confirmed over 2
+  frames before being published — this suppresses single-frame false positives.
+
+Step 7 — ROS2 Node + RViz (ros2_node/fusion_node.py)
+  The node subscribes to camera and LiDAR topics using ApproximateTimeSynchronizer
+  (slop=0.1s) so frames are paired by timestamp even if they don't arrive at
+  exactly the same time. It publishes:
+    /fusion/image_annotated  — camera with 2D boxes and distance labels
+    /fusion/points_colored   — depth-coloured point cloud (jet colormap, 0–50m)
+    /fusion/markers          — LINE_LIST markers for oriented 3D boxes
+    /fusion/tracks           — ARROW markers for Kalman velocity vectors
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. HOW WE BUILT IT — DEVELOPMENT TIMELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Phase 1 — Starting point
+  The repo started with a basic Python-only fusion demo (main.py). It had the
+  right architecture conceptually but several fundamental algorithmic and
+  engineering bugs that made it unusable on real data. The goal was to take this
+  skeleton and make it actually work end-to-end with a real ROS2 bag.
+
+Phase 2 — Algorithm audit and fixes
+  We went through each module and identified what was broken:
+  - lidar_processor.py: O(N²) clustering, yaw=0 always, RANSAC picking walls
+  - calibration.py: distortion coefficients stored but never used
+  - fusion.py: greedy IoU tracker with no velocity model
+  We fixed all five issues before moving to ROS2 integration. Tests came next
+  (36 tests across 3 files) to lock in the fixed behavior before integration.
+
+Phase 3 — ROS2 node
+  Built fusion_node.py to wrap the pipeline. The node had to handle:
+  - Encoding ambiguity from the bag (images came as BGRA, not BGR)
+  - Structured numpy array from PointCloud2 (Velodyne padding bytes)
+  - Time synchronization between camera and LiDAR streams
+  - Marker lifetime management so stale boxes don't persist in RViz
+
+Phase 4 — Real data debugging
+  Pointed the node at the actual bag (/home/reddy/project2_easy_simulated_data)
+  and hit a series of integration errors — E1 through E10 documented below.
+  Each one taught us something concrete about ROS2, sensor data formats, or
+  the domain gap between real-world-trained models and synthetic data.
+
+Phase 5 — Live in RViz
+  After all fixes, the full stack runs:
+    Terminal 1: ros2 bag play (with --clock)
+    Terminal 2: KISS-ICP odometry node (odom → velodyne TF)
+    Terminal 3: bash run_fusion.sh (our fusion node)
+    Terminal 4: rviz2 with our pre-built config
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. EVERY ERROR WE HIT AND HOW WE SOLVED IT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── E1: NumPy 2.x ABI Compatibility ────────────────────────────────────────
+
+  Error:
+    AttributeError: _ARRAY_API not found
+    ImportError: numpy.core.multiarray failed to import
+
+  What happened:
+    The system had NumPy 2.2 installed. Some compiled Python packages (like
+    certain sensor_msgs_py builds) were compiled against NumPy 1.x and expected
+    the old C ABI. When NumPy 2.x changed its internal layout, those compiled
+    extensions couldn't load.
+
+  Fix:
+    pip install "numpy<2"
+    Downgraded to NumPy 1.26.x. Not ideal long-term but necessary until all
+    downstream packages migrate. This is a common pitfall in ROS2 environments
+    where C extensions are pre-compiled at a specific NumPy version.
+
+
+── E2: CvBridge Encoding Error — rgb8 ─────────────────────────────────────
+
+  Error:
+    CvBridgeError: [rgb8] is not a color format
+
+  What happened:
+    We called imgmsg_to_cv2(img_msg, desired_encoding='rgb8') but the bag
+    image was published as bgr8. Some CvBridge versions refuse to convert
+    between color orderings when you specify a fixed encoding string.
+
+  Fix:
+    Switched to desired_encoding='passthrough' which gives you exactly what's
+    in the bag. Then we check img_msg.encoding and call cv2.cvtColor manually
+    with the right conversion flag. This is more robust across all bag types.
+
+
+── E3: CvBridge 8UC4 — Four-Channel Images ────────────────────────────────
+
+  Error:
+    CvBridgeError: encoding specified as rgb8, but image has incompatible
+    type 8UC4
+
+  What happened:
+    After fixing E2 we discovered the bag camera images were BGRA (4 channels),
+    not BGR (3 channels). The camera simulation was saving alpha-channel images.
+
+  Fix:
+    Added a channel-count branch: if raw.shape[2] == 4, use COLOR_BGRA2RGB
+    (or COLOR_RGBA2RGB if the encoding contains 'rgb'). The fusion node now
+    handles mono, BGR, BGRA, RGBA, and Bayer-pattern images automatically.
+
+
+── E4: PointCloud2 Structured Array Cast ───────────────────────────────────
+
+  Error:
+    TypeError: Cannot cast array data from dtype({'names':['x','y','z'],
+    'offsets':[0,4,8], 'itemsize':16}) to dtype('float32')
+
+  What happened:
+    pc2.read_points() returns a structured numpy array with named fields x, y, z
+    and an itemsize of 16 bytes. Velodyne LiDAR adds 4 bytes of padding after
+    each xyz triplet (for intensity + ring metadata). A direct .astype(float32)
+    or .reshape(-1, 3) fails because the actual memory layout doesn't pack into
+    3 floats cleanly.
+
+  Fix:
+    Detect structured arrays via .dtype.names, then explicitly extract and
+    column-stack the individual fields:
+      np.column_stack([pts['x'], pts['y'], pts['z']]).astype(np.float32)
+    This ignores the extra fields and produces a clean (N, 3) array.
+
+
+── E5: RViz Point Cloud Jerking / Jumping ──────────────────────────────────
+
+  What happened:
+    The point cloud in RViz was jumping violently every frame. The whole world
+    looked like it was teleporting.
+
+  Root cause:
+    Fixed Frame in RViz was set to velodyne_top_base_link — the LiDAR sensor's
+    own frame. Every new scan, RViz placed the entire world relative to the
+    sensor's current position. Since the sensor is moving, the world appears to
+    jump to a new origin every frame.
+
+  Fix:
+    Set Fixed Frame to odom. KISS-ICP publishes a continuous odom →
+    velodyne_top_base_link TF. In the odom frame the world is stable and the
+    sensor moves smoothly through it. This is the correct way to visualize any
+    moving sensor — always use a world-fixed frame, never the sensor frame.
+
+
+── E6: RViz "No tf data" — Point Cloud Invisible ───────────────────────────
+
+  What happened:
+    After fixing E5, the point cloud was still invisible. RViz showed:
+    "No tf data. Actual error: Lookup would require extrapolation into the past."
+
+  Root cause (the tricky one):
+    The bag was recorded in October 2025 (UNIX timestamps ~1760387xxx).
+    We were running in February 2026 (UNIX timestamps ~1771xxx). KISS-ICP was
+    publishing TF transforms stamped at current wall-clock time. When RViz tried
+    to transform a point cloud message stamped at October 2025 time, it looked in
+    the TF buffer for that timestamp, found nothing (because KISS-ICP had only
+    published transforms at Feb 2026 time), and gave up.
+
+    The gap was nearly 4 months of UNIX time. The TF buffer only holds a few
+    seconds of history. There was zero overlap.
+
+  Fix:
+    Play the bag with --clock flag:
+      ros2 bag play /path/to/bag --loop --clock
+    This makes the bag publish a /clock topic driving ROS2's simulated time.
+    Add use_sim_time:=true to all nodes so they read from /clock instead of
+    wall time. Now everyone — KISS-ICP, our fusion node, RViz — operates in the
+    same Oct 2025 simulated timeline. TF lookups succeed because they're all
+    using the same clock.
+
+  Why this matters:
+    This is one of the most common gotchas when replaying ROS2 bags that were
+    recorded at a different time than you're playing them. Always use --clock
+    and use_sim_time unless you know exactly why you don't need it.
+
+
+── E7: Shell Paste Error with Multi-line ROS Args ──────────────────────────
+
+  Error:
+    rclpy._rclpy_pybind11.UnknownROSArgsError: [' ']
+    -p: command not found
+
+  What happened:
+    We were copy-pasting long ros2 run commands with backslash line continuations
+    across multiple lines. Some terminals insert a space after the backslash or
+    drop it entirely, causing the arguments to be parsed wrong or run as separate
+    shell commands.
+
+  Fix:
+    Created run_fusion.sh with all arguments on a single long line. Run it with
+    bash run_fusion.sh — no copy-paste, no continuation characters, fully
+    repeatable.
+
+
+── E8: Mock Detector — 3 Permanent Bounding Boxes in RViz ─────────────────
+
+  What happened:
+    RViz was showing 3 bounding boxes that never moved and never disappeared,
+    regardless of what was in the scene.
+
+  Root cause:
+    ultralytics was not installed. YOLODetector catches the ImportError and falls
+    back to _mock_detect(), which always returns 3 hardcoded detections at fixed
+    image-relative positions (30-50% width for car 1, 60-75% width for car 2,
+    10-15% width for person). Since LiDAR data always had points somewhere in
+    those image regions, the fusion step produced 3 "objects" every frame at
+    nearly the same 3D positions → 3 permanent boxes.
+
+  Fix:
+    pip3 install ultralytics
+    Real YOLOv8n inference replaced the mock. Boxes became scene-dependent.
+
+
+── E9: KISS-ICP Not Found as ROS2 Package ──────────────────────────────────
+
+  Error:
+    Package 'kiss_icp' not found
+
+  What happened:
+    KISS-ICP is not a system ROS2 package. It's built in a separate colcon
+    workspace (~/kiss_ws). Running ros2 run kiss_icp ... without sourcing
+    kiss_ws makes ROS2 unaware it exists.
+
+  Fix:
+    source /home/reddy/kiss_ws/install/setup.bash before running the node.
+    This overlays kiss_ws on top of the system ROS2 environment.
+
+
+── E10: Zero Detections on Synthetic Data ──────────────────────────────────
+
+  What happened:
+    After installing ultralytics, the 3 permanent boxes disappeared. But the
+    node was now logging "0 det → 0 fused → 0 tracked" on almost every frame,
+    even in scenes with clearly visible cars and buildings.
+
+  Root cause:
+    YOLOv8n is trained on real-world COCO images. Our bag is synthetic/simulated
+    (game-engine style rendering). The domain gap means confidence scores for
+    even clearly visible sim cars were often 0.20–0.40, below the default
+    threshold of 0.45. Everything was being filtered out.
+
+    Additionally, some sim objects (floating rocks, stylized trees) are not COCO
+    classes at all — no threshold change would detect those regardless.
+
+  Fix:
+    Added -p confidence:=0.2 to run_fusion.sh. Detections now appear on urban
+    scenes with cars. The fundamental domain gap is not fully fixable without
+    fine-tuning on sim data, but lower threshold gets us usable detections.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. THE TEAM PROBLEM STORY (tell this in interviews)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Story: "The point cloud that disappeared in time"
+
+  Context to set up:
+    "We were integrating our fusion node with a real ROS2 bag for the first
+    time. Everything compiled and launched without errors. RViz opened. The
+    bag was playing. But the point cloud was completely invisible — just a black
+    screen. We saw this 'No tf data' warning but had no idea what it meant."
+
+  The investigation:
+    "We started by checking the obvious stuff — wrong topic name, wrong fixed
+    frame, missing TF publisher. We confirmed the LiDAR topic was publishing, we
+    confirmed KISS-ICP was running and outputting transforms, we set the fixed
+    frame correctly to odom. Still nothing.
+
+    Then we actually read the full error:
+      'Lookup would require extrapolation into the past'
+
+    That word 'past' was the clue. We checked the bag's timestamps with
+    ros2 bag info and saw the messages were stamped October 2025. We were sitting
+    in February 2026. KISS-ICP was publishing TF at February 2026 wall-clock
+    time. When RViz asked 'what's the transform at October 2025?', there was
+    literally nothing in the TF buffer at that time — it only keeps a few seconds
+    of history. The mismatch was about 4 months of UNIX time."
+
+  The fix and what we learned:
+    "The fix was one flag: play the bag with --clock and add use_sim_time:=true
+    to every node. That made the entire system run on the bag's simulated Oct
+    2025 timeline instead of real wall time. The moment we did that, the point
+    cloud appeared perfectly and KISS-ICP's odometry locked in immediately.
+
+    What I took away from this: in robotics, time is a first-class citizen.
+    Every message has a timestamp and every transform is looked up at a specific
+    time. If your clock sources don't agree, your whole sensor stack silently
+    breaks. It's not a bug in the code — it's a systems-level misalignment that
+    only shows up when you go from unit tests to real hardware or real bags."
+
+  Why this is a good story:
+    - Shows systematic debugging (not random changes)
+    - Demonstrates understanding of ROS2 architecture (TF, /clock, sim time)
+    - The fix was simple but finding it required real insight
+    - It's universally relatable in any robotics/embedded team
+    - Ends with a genuine technical lesson, not just "I fixed a bug"
+
+  Alternate shorter version (30 seconds):
+    "We had a point cloud that was completely invisible in RViz even though the
+    LiDAR topic was clearly publishing. After 30 minutes of debugging we found
+    the bag was recorded 4 months ago in Oct 2025, but our odometry node was
+    stamping TF transforms with today's Feb 2026 time. RViz would ask 'show me
+    the transform at Oct 2025' and the buffer was empty. One flag — --clock --
+    made the bag drive the system clock and everything snapped into place. Taught
+    me that in sensor systems, a clock mismatch is just as fatal as a broken wire."
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. ALGORITHM DEEP DIVES (for technical interviewers)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── O(1) Clustering Fix ─────────────────────────────────────────────────────
+
+  Original bug:
+    BFS over voxels. Inside the loop, for each voxel neighbor ID, the code did:
+      idx = np.where(unique_voxels == neighbor_id)
+    np.where scans the entire unique_voxels array every call. O(N) per step.
+    BFS visits every voxel, so total complexity: O(N²). On a 100k-point cloud
+    that's 10 billion operations. Pipeline froze.
+
+  Fix:
+    Before BFS, build a lookup dict once:
+      id_to_uidx = {vid: i for i, vid in enumerate(unique_voxels)}
+    Now each neighbor lookup is id_to_uidx[neighbor_id] — O(1) hash table.
+    Also replaced queue.pop(0) (O(N) list shift) with collections.deque.popleft()
+    (O(1) deque operation).
+    Total complexity: O(N). Works on dense real-world point clouds.
+
+  How to explain it simply:
+    "Imagine you're doing a BFS on a graph. Every time you want to visit a
+    neighbor, instead of searching through all nodes to find it, you use a
+    dictionary you built at the start. That's the difference between O(N²)
+    and O(N)."
+
+
+── PCA Yaw Estimation ──────────────────────────────────────────────────────
+
+  Problem:
+    All 3D boxes had yaw=0.0. Every object was assumed to face perfectly along
+    the X axis. Cars parked at an angle, pedestrians walking diagonally — all
+    had wrong box orientations.
+
+  How PCA fixes it:
+    1. Take the XY positions of all points in the cluster (ignore Z — heading
+       is a 2D quantity for ground vehicles)
+    2. Compute the 2x2 covariance matrix of the XY distribution
+    3. Find eigenvectors — the first eigenvector points along the direction of
+       maximum variance, which is the object's dominant orientation (its heading)
+    4. Compute yaw = atan2(ev[1], ev[0])
+    5. Rotate the cluster by -yaw into an aligned frame, compute AABB there
+    6. Rotate the box back by +yaw
+
+  Result: tighter, oriented boxes. A car parked at 45 degrees now gets a box
+  at 45 degrees rather than an oversized axis-aligned box.
+
+  Connection to other techniques:
+    This is mathematically equivalent to finding the minimum-area oriented
+    bounding rectangle. It's also related to ICP (Iterative Closest Point)
+    in that we're finding the principal axes of a point distribution.
+
+
+── Kalman Filter State Representation ──────────────────────────────────────
+
+  State vector:   x = [x, y, z, vx, vy, vz]^T   (position + velocity)
+  Observation:    z = [x, y, z]^T                (3D centroid only)
+
+  State transition (constant velocity):
+    x_k = F @ x_{k-1}
+    where F = [[I₃, dt·I₃],
+               [0₃,    I₃]]    (top-left: position, top-right: velocity step)
+
+  Predict:
+    x' = F @ x
+    P' = F @ P @ F^T + Q
+
+  Update (when detection matches):
+    y = z - H @ x'             (innovation: predicted vs actual observation)
+    S = H @ P' @ H^T + R       (innovation covariance)
+    K = P' @ H^T @ inv(S)      (Kalman gain)
+    x = x' + K @ y
+    P = (I - K @ H) @ P'
+
+  Q (process noise): models how much the object can accelerate between frames.
+    Tuned higher for xy (vehicles turn), lower for z (vehicles stay on ground).
+  R (measurement noise): models how accurately we measure position.
+    Tuned based on clustering accuracy — a few centimetres in x,y, more in z.
+
+  The key insight:
+    When a detection is missed for a frame, the Kalman filter just runs the
+    predict step with no update. The track coasts on its velocity estimate.
+    This handles brief occlusions without losing the track. The TemporalFusion
+    it replaced would immediately drop any object not seen for even one frame.
+
+
+── Hungarian Assignment ────────────────────────────────────────────────────
+
+  Problem: given M tracks and N new detections, find the optimal assignment.
+
+  Naive greedy: sort pairs by distance, greedily match closest. O(N² log N).
+    Greedy can make a locally good match that prevents a globally better one.
+
+  Hungarian algorithm: finds globally optimal minimum-cost assignment. O(N³).
+    With N typically < 20 objects, O(N³) is fast enough (microseconds).
+
+  We build a cost matrix C where C[i,j] = Euclidean distance between track i's
+  predicted position and detection j's 3D centroid. Any entry > dist_threshold
+  is set to infinity (gating — we never match a track to a detection that is
+  too far away even if it's the "closest" available).
+
+  scipy.optimize.linear_sum_assignment(C) returns the optimal row and column
+  indices. Post-filter by dist_threshold to reject gated pairs.
+
+
+── RANSAC Ground Removal ───────────────────────────────────────────────────
+
+  Algorithm:
+    Repeat N times:
+      1. Sample 3 random points
+      2. Fit plane through them (cross product gives normal)
+      3. Count inliers: points within height_threshold of the plane
+    Keep the plane with the most inliers.
+
+  Our horizontality guard:
+    After finding the best plane, check: abs(dot(normal, [0,0,1])) >= tol
+    If the plane is nearly vertical (a wall), reject it and fall back to a
+    flat z=min_z plane. Without this, on scenes with large buildings, RANSAC
+    would sometimes pick a building facade as the "dominant plane" and strip
+    the entire building from the point cloud, leaving ground points behind.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. QUESTIONS YOU MIGHT GET ASKED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Why frustum-based rather than early fusion or late fusion?
+A: Early fusion (concatenating raw sensor data) requires exact extrinsic
+   calibration and aligned resolution — hard to get right and sensitive to
+   calibration error. Late fusion (detect independently in each sensor and merge)
+   loses the ability to use camera semantics to guide LiDAR search. Frustum-based
+   is a middle ground: camera semantics constrain where in 3D space to look,
+   LiDAR provides the depth. It's the approach used in Frustum PointNets (Qi
+   et al., CVPR 2018).
+
+Q: What is the bottleneck in your pipeline?
+A: YOLO inference is the heaviest step — ~15-25ms per frame on CPU for YOLOv8n.
+   Clustering and Kalman update are microseconds. Overall the pipeline runs at
+   ~30ms per frame (≈30Hz) on CPU, fast enough for our 10Hz LiDAR data.
+
+Q: How does your tracker handle occlusions?
+A: Kalman predict step runs even when no detection matches — the track coasts
+   on its velocity estimate. max_age=8 means a track survives up to 8 consecutive
+   missed frames before deletion. min_hits=2 means a new track isn't published
+   until confirmed over 2 frames, suppressing spurious single-frame detections.
+
+Q: What would you improve if you had more time?
+A: Three things. First, real calibration — we used default approximate intrinsics
+   and extrinsics. Real calibration from the bag's calibration data would give
+   much tighter frustum extraction. Second, a larger YOLO model (yolov8s or m)
+   or fine-tuning on synthetic data to close the domain gap. Third, SORT/DeepSORT
+   for appearance-based re-identification after long occlusions — the Kalman
+   tracker alone loses tracks after max_age frames even if the object comes back.
+
+Q: Why ROS2 and not ROS1?
+A: ROS2 uses DDS for transport (reliable pub/sub), has proper QoS configuration,
+   no roscore dependency, and is the standard for new robotics projects. The bag
+   we were given was already in ROS2 mcap format. KISS-ICP also has better ROS2
+   support.
+
+Q: What is KISS-ICP and why do you need it?
+A: KISS-ICP is a LiDAR odometry algorithm — it computes the ego-motion of the
+   sensor frame over time by iteratively aligning consecutive point clouds.
+   We need it to publish the odom → velodyne_top_base_link TF transform, which
+   RViz uses to place the LiDAR point cloud in a world-fixed frame (odom).
+   Without it, we'd have no transform and the point cloud wouldn't render.
+
+Q: How would you evaluate this system quantitatively?
+A: KITTI-format evaluation: compare our 3D bounding boxes against ground truth
+   annotations using 3D IoU at thresholds of 0.25 and 0.5, report Average
+   Precision across classes. For tracking, use CLEAR MOT metrics: MOTA
+   (multi-object tracking accuracy), MOTP (precision), ID switches, and
+   fragmentation count. We don't have ground truth for this bag, so currently
+   evaluation is qualitative via RViz.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. KEY NUMBERS TO REMEMBER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  36 unit tests (9 calibration, 13 fusion, 14 lidar_processor)
+  6 algorithm upgrades over the original repo
+  10 integration errors hit and resolved during development
+  ~30ms per frame end-to-end latency (CPU)
+  6-dimensional Kalman state [x, y, z, vx, vy, vz]
+  O(N) clustering (was O(N²))
+  O(N³) Hungarian assignment (was O(N²) greedy)
+  0.2 confidence threshold (lowered from 0.5 for synthetic data)
+  8 max_age frames before track deletion
+  2 min_hits for track confirmation
+  4 ROS2 topics published by the fusion node
+  4 terminals to run the full stack
+
+
+================================================================================
+  END OF INTERVIEW REFERENCE
+================================================================================
