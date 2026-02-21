@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
 
+import cv2
 import numpy as np
 import yaml
 
@@ -209,33 +210,46 @@ class LidarCameraCalibration:
         with open(path, 'w') as f:
             yaml.dump(data, f)
 
-    def project_points(self, points_lidar: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def project_points(self, points_lidar: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Project 3D LiDAR points to 2D image coordinates.
+        Project 3D LiDAR points to 2D image coordinates with distortion correction.
+
+        Uses cv2.projectPoints to apply the full lens distortion model
+        (radial k1,k2,k3 and tangential p1,p2) stored in camera.D.
+        For rectified datasets (e.g. KITTI) D is all zeros so this is a no-op.
 
         Args:
             points_lidar: Nx3 array of points in LiDAR frame
 
         Returns:
-            pixels: Nx2 array of pixel coordinates
-            depths: N array of depths (z in camera frame)
+            pixels:     Nx2 array of distorted pixel coordinates
+            depths:     N  array of depths (z in camera frame, metres)
+            valid_mask: N  bool array — True for points in front of camera
         """
-        N = points_lidar.shape[0]
+        if points_lidar.ndim != 2 or points_lidar.shape[1] != 3:
+            raise ValueError(f"Expected Nx3 input, got {points_lidar.shape}")
 
-        # Transform to camera frame
+        # --- Transform to camera frame ---
         points_cam = (self.R @ points_lidar.T + self.t).T  # Nx3
+        depths = points_cam[:, 2].copy()
+        valid_mask = depths > 0.1
 
-        # Filter points behind camera
-        valid_mask = points_cam[:, 2] > 0.1
+        # Initialise output with zeros; only fill valid points
+        pixels = np.zeros((len(points_lidar), 2), dtype=np.float64)
 
-        # Project to image plane
-        depths = points_cam[:, 2]
+        if valid_mask.any():
+            pts_valid = points_cam[valid_mask]          # Mx3
 
-        # Homogeneous coordinates
-        points_norm = points_cam / depths.reshape(-1, 1)  # Nx3
-
-        # Apply intrinsics
-        pixels = (self.camera.K @ points_norm.T).T[:, :2]  # Nx2
+            # cv2.projectPoints expects shape (N,1,3) and returns (N,1,2)
+            rvec = np.zeros(3, dtype=np.float64)        # no extra rotation
+            tvec = np.zeros(3, dtype=np.float64)        # no extra translation
+            projected, _ = cv2.projectPoints(
+                pts_valid.reshape(-1, 1, 3).astype(np.float64),
+                rvec, tvec,
+                self.camera.K.astype(np.float64),
+                self.camera.D.astype(np.float64)
+            )
+            pixels[valid_mask] = projected.reshape(-1, 2)
 
         return pixels, depths, valid_mask
 
